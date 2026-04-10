@@ -1,0 +1,394 @@
+# =============================================================================
+# FRIEND AGENT — Docker Compose
+# =============================================================================
+# WHY DOCKER COMPOSE?
+#   Instead of installing Postgres, Redis, MongoDB etc. directly on your
+#   machine (which causes version conflicts and pollutes your system), we
+#   run each service in an isolated container. One command starts everything,
+#   one command tears it down cleanly.
+#
+# HOW TO USE:
+#   Start everything:  docker-compose up -d
+#   See logs:          docker-compose logs -f <service>
+#   Stop everything:   docker-compose down
+#   Wipe all data:     docker-compose down -v   ← the -v removes volumes
+# =============================================================================
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+# WHY A CUSTOM NETWORK?
+#   All services on the same network can reach each other by SERVICE NAME
+#   instead of IP address. So FastAPI talks to Postgres at host="postgres",
+#   not "172.18.0.3" which changes every restart.
+# =============================================================================
+networks:
+  friend-net:
+    driver: bridge
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+# WHY VOLUMES?
+#   Containers are ephemeral — when they restart, their filesystem resets.
+#   Volumes are persistent storage that survive restarts. Without volumes,
+#   you'd lose your database every time you run `docker-compose down`.
+# =============================================================================
+volumes:
+  postgres_data:
+  mongo_data:
+  redis_data:
+  qdrant_data:
+  ollama_data:
+  langfuse_postgres_data:   # Langfuse needs its own separate Postgres DB
+
+
+services:
+
+  # ===========================================================================
+  # POSTGRESQL — Static / relational data
+  # ===========================================================================
+  # WHAT GOES HERE: users, personality_types, compatibility_map
+  # WHY POSTGRES NOT MYSQL: Better JSON support, better full-text search,
+  #   pgvector extension available if you ever want vectors here too.
+  # PORT: 5432 is the Postgres default. We expose it so you can connect
+  #   with a GUI tool like TablePlus or DBeaver from your host machine.
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine          # alpine = smaller image, same features
+    container_name: friend-postgres
+    restart: unless-stopped            # auto-restart on crash, stop on `down`
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data   # persist DB files
+      - ./backend/db/init.sql:/docker-entrypoint-initdb.d/init.sql  # seed script
+    ports:
+      - "5432:5432"                    # host:container
+    networks:
+      - friend-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # MONGODB — Dynamic / document data
+  # ===========================================================================
+  # WHAT GOES HERE: sessions, mood_logs, extracted events, journal entries
+  # WHY MONGO: These documents have nested arrays and evolving schemas.
+  #   A session document contains an array of turns, each turn has metadata.
+  #   Modeling this in SQL needs 3+ tables and complex joins. In Mongo it's
+  #   one document you can read and write atomically.
+  # ALTERNATIVE: PostgreSQL with JSONB — works, but Mongo's aggregation
+  #   pipeline is more expressive for the analytics we'll need later.
+  # ===========================================================================
+  mongo:
+    image: mongo:7
+    container_name: friend-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGO_DB}
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - friend-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # REDIS — Message broker + cache
+  # ===========================================================================
+  # TWO JOBS IN ONE:
+  #   1. Celery broker: when FastAPI fires a background task (e.g. "schedule
+  #      an exam reminder"), it pushes a message to Redis. The Celery worker
+  #      picks it up and executes it. This decouples your API from slow work.
+  #   2. Cache: store the user's last-built context envelope so we don't
+  #      hit Postgres + Mongo + Qdrant on every single message.
+  # WHY REDIS NOT RABBITMQ: Redis is simpler to run, handles both caching
+  #   and queuing, and is more than sufficient at this scale. RabbitMQ shines
+  #   when you need complex routing or guaranteed delivery at massive scale.
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: friend-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes   # AOF persistence — survives restarts
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - friend-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # QDRANT — Vector database for semantic memory
+  # ===========================================================================
+  # WHAT GOES HERE: embeddings of session summaries and memory chunks
+  # WHY QDRANT: Fully open source, runs locally, has a built-in web UI at
+  #   localhost:6333/dashboard. You can literally see your vectors and run
+  #   test searches in the browser. Great for learning.
+  # ALTERNATIVE: ChromaDB (simpler, in-process, less visibility),
+  #   pgvector (fewer services to run but less specialized).
+  # HOW IT WORKS: You convert text → float array (embedding), store it with
+  #   metadata (user_id, session_id, timestamp). At query time you embed the
+  #   user's message and find the closest stored vectors by cosine similarity.
+  # ===========================================================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: friend-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"    # REST API + web dashboard
+      - "6334:6334"    # gRPC (faster for bulk operations)
+    networks:
+      - friend-net
+
+  # ===========================================================================
+  # OLLAMA — Local LLM inference
+  # ===========================================================================
+  # WHAT THIS IS: Runs open-source LLMs (Llama3, Mistral, Phi3) entirely
+  #   on your machine. No API key, no cost, no data leaves your laptop.
+  # HOW IT WORKS: Ollama exposes an OpenAI-compatible API at port 11434.
+  #   LangGraph talks to it exactly like it would talk to GPT-4 — just
+  #   a different base_url. This means swapping to Claude API later is
+  #   literally one line change.
+  # FIRST TIME SETUP: After `docker-compose up`, pull a model:
+  #   docker exec -it friend-ollama ollama pull llama3.2
+  #   docker exec -it friend-ollama ollama pull nomic-embed-text  ← for embeddings
+  # PERFORMANCE: On CPU it's slow (10-30s per response). If you have an
+  #   Nvidia GPU, add the `deploy` section below and uncomment it.
+  # ===========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: friend-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama      # model weights persist here (~4GB per model)
+    ports:
+      - "11434:11434"
+    networks:
+      - friend-net
+    # --- Uncomment if you have an Nvidia GPU ---
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ===========================================================================
+  # LANGFUSE — LLM Observability (self-hosted)
+  # ===========================================================================
+  # WHAT THIS GIVES YOU:
+  #   A visual dashboard showing every LLM call your agent makes:
+  #   - Which tools were called and in what order
+  #   - How long each LLM call took
+  #   - Exact prompt sent and response received
+  #   - Token usage and cost estimates
+  #   - Session-level traces you can share and compare
+  #
+  # WHY THIS MATTERS FOR LEARNING:
+  #   When you build a multi-step agent graph, you often don't know WHY it
+  #   gave a bad answer. Langfuse shows you the exact tool call sequence,
+  #   the intermediate outputs, and where the reasoning went wrong.
+  #
+  # ARCHITECTURE: Langfuse itself needs two databases:
+  #   - Its own Postgres (user accounts, project config)
+  #   - Clickhouse (stores millions of trace events efficiently)
+  #
+  # ACCESS: http://localhost:3000 — create an account on first visit
+  # ===========================================================================
+  langfuse-db:
+    image: postgres:16-alpine
+    container_name: friend-langfuse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse_secret
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    networks:
+      - friend-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 10s
+      retries: 5
+
+  langfuse:
+    # Pin to v2 — stable, single-process, no Clickhouse needed.
+    # Langfuse v3+ requires separate worker containers and extra config.
+    image: langfuse/langfuse:2
+    container_name: friend-langfuse
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse_secret@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ${LANGFUSE_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      LANGFUSE_INIT_ORG_ID: friend-agent-org
+      LANGFUSE_INIT_ORG_NAME: FriendAgent
+      LANGFUSE_INIT_PROJECT_ID: friend-agent-project
+      LANGFUSE_INIT_PROJECT_NAME: friend-agent
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_EMAIL}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_PASSWORD}
+      LANGFUSE_INIT_USER_NAME: admin
+      TELEMETRY_ENABLED: "false"
+    ports:
+      - "3000:3000"
+    networks:
+      - friend-net
+
+  # ===========================================================================
+  # FLOWER — Celery task monitor
+  # ===========================================================================
+  # WHAT THIS IS: A web UI showing all your Celery tasks in real time.
+  #   You can see pending/active/failed tasks, retry failed ones, inspect
+  #   task arguments, and see how long each task took.
+  # WHY USEFUL: When "exam reminder" isn't firing, Flower tells you if the
+  #   task was received, if the worker is alive, and what error occurred.
+  # ACCESS: http://localhost:5555
+  # ===========================================================================
+  flower:
+    image: mher/flower:2.0
+    container_name: friend-flower
+    restart: unless-stopped
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    networks:
+      - friend-net
+    depends_on:
+      - redis
+
+  # ===========================================================================
+  # BACKEND — FastAPI application
+  # ===========================================================================
+  # WHY BUILD CONTEXT NOT IMAGE:
+  #   We build from our local Dockerfile so code changes reload instantly
+  #   (via uvicorn --reload). If we used a pre-built image we'd have to
+  #   rebuild on every code change.
+  # VOLUMES: Mount the source code so changes appear without rebuilding.
+  # DEPENDS_ON: Ensures DBs are healthy before the app tries to connect.
+  # ===========================================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: friend-backend
+    restart: unless-stopped
+    env_file: .env                     # loads all environment variables
+    volumes:
+      - ./backend:/app                 # live reload — edit code, see changes
+    ports:
+      - "8000:8000"
+    networks:
+      - friend-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ===========================================================================
+  # CELERY WORKER — Background task processor
+  # ===========================================================================
+  # SAME IMAGE AS BACKEND — it runs the same Python code, just a different
+  #   entrypoint. The worker listens to Redis for tasks and executes them.
+  # WHY SEPARATE CONTAINER: The API server (backend) must respond in
+  #   milliseconds. Scheduling a reminder might take seconds (querying DB,
+  #   calculating time deltas). We offload that to a worker so the API
+  #   never blocks. This is the core of async architecture.
+  # CONCURRENCY 4: The worker runs 4 tasks simultaneously. Increase if
+  #   you have more CPU cores and heavier workloads.
+  # ===========================================================================
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: friend-celery-worker
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./backend:/app
+    networks:
+      - friend-net
+    depends_on:
+      - redis
+      - postgres
+      - mongo
+    command: celery -A app.tasks.celery_app:celery_app worker --loglevel=info --concurrency=4
+
+  # ===========================================================================
+  # CELERY BEAT — Periodic task scheduler
+  # ===========================================================================
+  # WHAT THIS DOES: Runs scheduled tasks on a timer. This is what fires
+  #   "send daily journal summary at 9pm" every day. Beat is like cron
+  #   but integrated with Celery — it pushes tasks to Redis on schedule,
+  #   and the worker picks them up.
+  # WHY SEPARATE FROM WORKER: Beat is a single-threaded scheduler. Running
+  #   it inside the worker causes duplicate task scheduling if you scale
+  #   to multiple workers. Always keep beat as exactly one instance.
+  # ===========================================================================
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: friend-celery-beat
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./backend:/app
+    networks:
+      - friend-net
+    depends_on:
+      - redis
+    command: celery -A app.tasks.celery_app:celery_app beat --loglevel=info
+
+  # ===========================================================================
+  # FRONTEND — React + Vite dev server
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: friend-frontend
+    restart: unless-stopped
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules          # don't override node_modules with host
+    ports:
+      - "5173:5173"
+    networks:
+      - friend-net
+    depends_on:
+      - backend
+    command: npm run dev -- --host  # --host exposes to Docker network
